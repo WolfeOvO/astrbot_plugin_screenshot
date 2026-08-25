@@ -1,14 +1,17 @@
 """AstrBot 本地网页截图插件
 
 基于 Playwright Chromium 在本地渲染网页并截图发送，不依赖任何第三方截图 API。
+支持高清渲染（device_scale_factor=2）、发图后追加元数据消息、源码自动同步 GitHub。
 """
 
 import asyncio
 import ipaddress
 import os
 import socket
+import subprocess
 import tempfile
-from typing import Any, AsyncGenerator, Optional
+import time
+from typing import Optional
 from urllib.parse import urlparse
 
 from astrbot.api import AstrBotConfig, logger
@@ -17,10 +20,18 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 PLUGIN_NAME = "astrbot_plugin_screenshot"
-PLUGIN_VERSION = "v1.0.0"
+PLUGIN_VERSION = "v2.0.0"
 
 # 支持的截图格式
 SUPPORTED_FORMATS = {"png", "jpeg", "webp"}
+
+# 单次导航的最大超时（毫秒）。跨境站点（如 baidu.com 裸域）的 TCP/TLS
+# 建连可能要 10~17s，必须远大于默认 30s，否则在连接阶段就超时
+# （报错 Page.goto: Timeout 30000ms exceeded）。
+NAV_TIMEOUT_MS = 90_000
+
+# 高清渲染倍率（Retina）。2 = 逻辑像素翻倍，文字/图片更清晰，文件更大。
+SCALE_FACTOR = 2
 
 
 def _is_blocked_ip(ip_str: str) -> bool:
@@ -62,11 +73,11 @@ def resolve_and_check(host: str, port: int = 443) -> Optional[str]:
 class LocalScreenshotPlugin(Star):
     """本地网页截图插件
 
-    用法：/截图 <url> [format=png] [width=1920] [height=1080] [full=0]
+    用法：/截图 <url> [format=png] [width=1920] [height=1080] [full=0] [scale=2]
     """
 
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-    MAX_EDGE = 4096  # 单边最大像素
+    MAX_FILE_SIZE = 15 * 1024 * 1024  # 15MB（高清后文件更大，放宽限制）
+    MAX_EDGE = 8192  # 单边最大像素（含 scale 后）
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -76,15 +87,18 @@ class LocalScreenshotPlugin(Star):
         self.default_height = int(config.get("default_height", 1080))
         self.block_private = bool(config.get("block_private_network", True))
         self.user_agent = str(config.get("user_agent", "") or "").strip()
+        self.sync_github = bool(config.get("sync_to_github", True))
 
         self._pw = None
         self._browser = None
         self._browser_lock = asyncio.Lock()
         # 限制并发截图数量，避免同时开太多页面
         self._sem = asyncio.Semaphore(2)
-        logger.info(f"[{PLUGIN_NAME}] 初始化完成，超时={self.timeout_s}s，"
+        logger.info(f"[{PLUGIN_NAME}] 初始化完成 v{PLUGIN_VERSION}，超时={self.timeout_s}s，"
                     f"默认尺寸={self.default_width}x{self.default_height}，"
-                    f"内网拦截={'开' if self.block_private else '关'}")
+                    f"高清倍率={SCALE_FACTOR}，"
+                    f"内网拦截={'开' if self.block_private else '关'}，"
+                    f"GitHub同步={'开' if self.sync_github else '关'}")
 
     # ------------------------------------------------------------------
     # 浏览器生命周期
@@ -165,6 +179,7 @@ class LocalScreenshotPlugin(Star):
             "width": self.default_width,
             "height": self.default_height,
             "full": False,
+            "scale": SCALE_FACTOR,
         }
         tokens = tail.split()
         if not tokens:
@@ -198,6 +213,15 @@ class LocalScreenshotPlugin(Star):
                         params[key] = v
                 except ValueError:
                     errors.append(f"{key} 必须是整数: {value}")
+            elif key == "scale":
+                try:
+                    v = int(value)
+                    if not (1 <= v <= 3):
+                        errors.append(f"scale 超出范围 1-3: {v}")
+                    else:
+                        params["scale"] = v
+                except ValueError:
+                    errors.append(f"scale 必须是整数: {value}")
             elif key == "full":
                 params["full"] = value.lower() in ("1", "true", "yes", "on")
             else:
@@ -207,8 +231,31 @@ class LocalScreenshotPlugin(Star):
     # ------------------------------------------------------------------
     # 截图核心
     # ------------------------------------------------------------------
-    async def _render(self, params: dict) -> bytes:
-        """渲染网页并返回截图二进制数据。"""
+    async def _navigate(self, page, url: str):
+        """导航到目标 URL。裸域（如 baidu.com）的 301 重定向链在境外
+        可能卡死，自动补 www. 重试一次。"""
+        from urllib.parse import urlparse as _up
+        try:
+            await page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            return None
+        except Exception as e:
+            err = str(e)
+            parsed = _up(url)
+            if parsed.hostname and not parsed.hostname.startswith("www.") \
+                    and "Timeout" in err:
+                new_url = url.replace(f"//{parsed.hostname}", f"//www.{parsed.hostname}", 1)
+                logger.warning(f"[{PLUGIN_NAME}] 裸域导航超时，重试 {new_url}")
+                await page.goto(new_url, timeout=NAV_TIMEOUT_MS,
+                                wait_until="domcontentloaded")
+                return new_url
+            raise
+
+    async def _render(self, params: dict) -> tuple[bytes, dict]:
+        """渲染页面并返回 (截图二进制数据, 元信息 dict)。
+
+        高清渲染（device_scale_factor）+ domcontentloaded + 追踪域名拦截。
+        导航超时独立设为 90s，规避跨境建连慢；裸域失败自动补 www 重试。
+        """
         host = urlparse(params["url"]).hostname
         if self.block_private:
             reason = await asyncio.get_event_loop().run_in_executor(
@@ -222,21 +269,44 @@ class LocalScreenshotPlugin(Star):
             viewport={"width": params["width"], "height": params["height"]},
             locale="zh-CN",
             user_agent=self.user_agent or None,
+            device_scale_factor=params["scale"],
         )
+
+        # ---------- 拦截常见追踪请求 ----------
+        BLOCK_HOSTS = {
+            "hm.baidu.com",
+            "tongji.baidu.com",
+            "dup.baidustatic.com",
+            "als.baidu.com",
+            "bdimg.share.baidu.com",
+        }
+
+        async def _block_route(route):
+            url = route.request.url
+            if any(h in url for h in BLOCK_HOSTS):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await context.route("**/*", _block_route)
+        # -----------------------------------------
+
+        context.set_default_timeout(NAV_TIMEOUT_MS)
+
         page = await context.new_page()
         try:
-            await page.goto(
-                params["url"],
-                timeout=self.timeout_s * 1000,
-                wait_until="load",
-            )
-            # 给动态内容一点加载时间，超时不致命
+            t0 = time.time()
+            await self._navigate(page, params["url"])
+            # 等待页面关键元素出现，以确保渲染完成（不致命）
             try:
-                await page.wait_for_load_state("networkidle", timeout=3000)
+                await page.wait_for_selector(
+                    "input#kw, input[name=wd], input[type=search]",
+                    timeout=15000,
+                )
             except Exception:
                 pass
 
-            # 跳转后二次校验最终地址，防止 302 到内网
+            # 二次跳转后再次检查内网拦截
             if self.block_private:
                 final_host = urlparse(page.url).hostname
                 if final_host and final_host != host:
@@ -249,20 +319,34 @@ class LocalScreenshotPlugin(Star):
             shot_kwargs = {
                 "type": params["format"],
                 "full_page": params["full"],
-                "timeout": 20000,
+                "timeout": 30000,
             }
+            # 高质量：PNG 无损；jpeg/webp 用高画质
             if params["format"] in ("jpeg", "webp"):
-                shot_kwargs["quality"] = 85
+                shot_kwargs["quality"] = 95
             data = await page.screenshot(**shot_kwargs)
             if not data:
                 raise RuntimeError("截图返回空数据")
-            return data
+
+            elapsed = time.time() - t0
+            meta = {
+                "url": params["url"],
+                "final_url": page.url,
+                "format": params["format"],
+                "width": params["width"] * params["scale"],
+                "height": params["height"] * params["scale"],
+                "scale": params["scale"],
+                "full": params["full"],
+                "bytes": len(data),
+                "elapsed": round(elapsed, 1),
+            }
+            return data, meta
         finally:
             await context.close()
 
     @staticmethod
     def _shrink_if_needed(data: bytes, fmt: str, max_size: int) -> bytes:
-        """截图过大时用 PIL 逐步缩小尺寸。"""
+        """截图过大时用 PIL 逐步缩小尺寸（仅在超限时触发，默认不压缩）。"""
         if len(data) <= max_size or fmt not in ("png", "jpeg", "webp"):
             return data
         try:
@@ -276,7 +360,7 @@ class LocalScreenshotPlugin(Star):
                 img = img.resize((w * 3 // 4, h * 3 // 4))
                 buf = io.BytesIO()
                 save_fmt = "JPEG" if fmt == "jpeg" else fmt.upper()
-                save_kwargs = {"quality": 80} if fmt in ("jpeg", "webp") else {}
+                save_kwargs = {"quality": 90} if fmt in ("jpeg", "webp") else {}
                 if save_fmt == "JPEG" and img.mode in ("RGBA", "P"):
                     img = img.convert("RGB")
                 img.save(buf, format=save_fmt, **save_kwargs)
@@ -289,6 +373,65 @@ class LocalScreenshotPlugin(Star):
             return data
 
     # ------------------------------------------------------------------
+    # GitHub 同步
+    # ------------------------------------------------------------------
+    def _sync_to_github(self) -> str:
+        """把插件源码同步推送到 GitHub 仓库。
+
+        插件目录在容器内即 /AstrBot/data/plugins/astrbot_plugin_screenshot，
+        宿主机侧挂载可见。使用环境变量 GITHUB_TOKEN 进行认证推送。
+        Returns: 状态字符串。
+        """
+        import os as _os
+        plugin_dir = _os.path.dirname(_os.path.abspath(__file__))
+        token = _os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            return "⚠️ 未配置 GITHUB_TOKEN，跳过同步"
+        repo = "WolfeOvO/astrbot_plugin_screenshot"
+        remote = f"https://x-access-token:{token}@github.com/{repo}.git"
+        try:
+            # 在插件目录初始化/复用 git 仓库
+            if not _os.path.exists(_os.path.join(plugin_dir, ".git")):
+                subprocess.run(["git", "init", "-q"], cwd=plugin_dir, check=True)
+                subprocess.run(["git", "remote", "add", "origin", remote],
+                               cwd=plugin_dir, check=True)
+            else:
+                # 更新 remote URL（含 token，避免凭据缺失）
+                subprocess.run(["git", "remote", "set-url", "origin", remote],
+                               cwd=plugin_dir, check=True)
+            # 配置身份（仅本仓库）
+            subprocess.run(["git", "config", "user.email", "bot@astrbot.local"],
+                           cwd=plugin_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "AstrBot Screenshot Plugin"],
+                           cwd=plugin_dir, check=True)
+            # 拉取远端（避免 non-fast-forward）
+            subprocess.run(["git", "fetch", "-q", "origin", "main"],
+                           cwd=plugin_dir, capture_output=True)
+            subprocess.run(["git", "reset", "-q", "--mixed", "origin/main"],
+                           cwd=plugin_dir, capture_output=True)
+            # 只添加插件自身文件，不递归父目录
+            for f in ("main.py", "metadata.yaml", "_conf_schema.json",
+                      "requirements.txt", "README.md"):
+                fp = _os.path.join(plugin_dir, f)
+                if _os.path.exists(fp):
+                    subprocess.run(["git", "add", "-f", f], cwd=plugin_dir, check=True)
+            # 若有变更则提交并推送
+            r = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                               cwd=plugin_dir)
+            if r.returncode == 0:
+                return "✅ 源码已是最新，无需推送"
+            msg = f"chore: sync v{PLUGIN_VERSION} @ {time.strftime('%Y-%m-%d %H:%M')}"
+            subprocess.run(["git", "commit", "-q", "-m", msg],
+                           cwd=plugin_dir, check=True)
+            pr = subprocess.run(["git", "push", "-q", "origin", "HEAD:main"],
+                                cwd=plugin_dir, capture_output=True, text=True)
+            if pr.returncode != 0:
+                return f"⚠️ 推送失败: {pr.stderr[:120]}"
+            return f"✅ 已同步 v{PLUGIN_VERSION} 到 GitHub"
+        except Exception as e:
+            return f"⚠️ 同步异常: {str(e)[:120]}"
+
+    # ------------------------------------------------------------------
     # 命令入口
     # ------------------------------------------------------------------
     @filter.command("截图", alias={"网页截图", "截图网页", "webshot"}, desc="本地网页截图")
@@ -296,27 +439,29 @@ class LocalScreenshotPlugin(Star):
         params, errors = self._parse_args(tail or "")
         if errors:
             msg = "⚠️ 参数错误：\n" + "\n".join(f"• {e}" for e in errors)
-            msg += "\n\n📖 用法：/截图 <url> [format=png] [width=1920] [height=1080] [full=0]"
+            msg += "\n\n📖 用法：/截图 <url> [format=png] [width=1920] [height=1080] [full=0] [scale=2]"
             yield event.plain_result(msg)
             return
 
         url = params["url"]
         host = urlparse(url).hostname
 
-        yield event.plain_result(f"📸 正在本地渲染截图：{host} ...")
+        yield event.plain_result(f"📸 正在本地高清渲染截图：{host} ...")
 
         temp_file = None
+        deleted = False
         try:
+            # 外层总超时 = 导航超时(90s) + 截图/收缩余量，给慢网足够空间
             async with self._sem:
-                data = await asyncio.wait_for(
-                    self._render(params), timeout=self.timeout_s + 30
+                data, meta = await asyncio.wait_for(
+                    self._render(params), timeout=120
                 )
             data = self._shrink_if_needed(data, params["format"], self.MAX_FILE_SIZE)
             if len(data) > self.MAX_FILE_SIZE:
                 yield event.plain_result(
                     f"❌ 截图过大（{len(data) / 1024 / 1024:.1f}MB），"
                     f"超过 {self.MAX_FILE_SIZE // 1024 // 1024}MB 限制，"
-                    f"可尝试 full=0 只截视窗区域"
+                    f"可尝试 full=0 或 scale=1"
                 )
                 return
 
@@ -325,13 +470,42 @@ class LocalScreenshotPlugin(Star):
                 f.write(data)
 
             logger.info(f"[{PLUGIN_NAME}] 截图完成: {url} -> {len(data)} bytes")
+            # 发送图片
             yield event.image_result(temp_file)
+            # 发完即删本地临时文件
+            try:
+                os.unlink(temp_file)
+                deleted = True
+                logger.info(f"[{PLUGIN_NAME}] 已发送并删除临时文件: {temp_file}")
+            except OSError as e:
+                logger.warning(f"[{PLUGIN_NAME}] 删除临时文件失败: {e}")
+
+            # 发送元数据消息
+            meta_lines = [
+                "📊 截图信息",
+                f"• 原始 URL：{meta['url']}",
+                f"• 落地 URL：{meta['final_url']}",
+                f"• 格式：{meta['format'].upper()}　倍率：{meta['scale']}x",
+                f"• 分辨率：{meta['width']}×{meta['height']}",
+                f"• 大小：{meta['bytes']/1024:.1f} KB",
+                f"• 渲染耗时：{meta['elapsed']}s",
+            ]
+            # GitHub 同步（异步执行，不阻塞发送）
+            if self.sync_github:
+                try:
+                    sync_result = await asyncio.get_event_loop().run_in_executor(
+                        None, self._sync_to_github
+                    )
+                    meta_lines.append(f"• 源码同步：{sync_result}")
+                except Exception as e:
+                    meta_lines.append(f"• 源码同步：⚠️ {str(e)[:80]}")
+            yield event.plain_result("\n".join(meta_lines))
         except PermissionError as e:
             logger.warning(f"[{PLUGIN_NAME}] SSRF 拦截: {url} - {e}")
             yield event.plain_result(f"🚫 已拦截：{e}")
         except asyncio.TimeoutError:
             yield event.plain_result(
-                f"⏱️ 截图超时（{self.timeout_s + 30}s）：{host}，页面可能加载过慢"
+                f"⏱️ 截图超时（120s）：{host}，跨境站点建连过慢或页面无响应"
             )
         except Exception as e:
             err = str(e)
@@ -344,7 +518,7 @@ class LocalScreenshotPlugin(Star):
             else:
                 yield event.plain_result(f"❌ 截图失败：{err[:200]}")
         finally:
-            if temp_file and os.path.exists(temp_file):
+            if temp_file and not deleted and os.path.exists(temp_file):
                 try:
                     os.unlink(temp_file)
                 except OSError:

@@ -3,19 +3,19 @@
     "description": "页面加载超时（秒）",
     "type": "int",
     "default": 30,
-    "hint": "页面 goto 的超时时间，整体命令超时为此值+30秒"
+    "hint": "页面 goto 的超时时间，整体命令超时为此值+90秒"
   },
   "default_width": {
     "description": "默认视窗宽度（像素）",
     "type": "int",
     "default": 1920,
-    "hint": "范围 100-4096"
+    "hint": "范围 100-8192（含高清倍率后）"
   },
   "default_height": {
     "description": "默认视窗高度（像素）",
     "type": "int",
     "default": 1080,
-    "hint": "范围 100-4096"
+    "hint": "范围 100-8192（含高清倍率后）"
   },
   "block_private_network": {
     "description": "拦截内网地址（SSRF 防护）",
@@ -28,5 +28,11 @@
     "type": "string",
     "default": "",
     "hint": "留空使用 Chromium 默认 UA"
+  },
+  "sync_to_github": {
+    "description": "截图后自动同步源码到 GitHub",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后每次截图会把插件源码 push 到 GitHub 仓库（需配置 GITHUB_TOKEN 环境变量）"
   }
 }
