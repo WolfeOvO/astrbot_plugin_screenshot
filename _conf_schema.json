@@ -1,0 +1,32 @@
+{
+  "timeout": {
+    "description": "页面加载超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "页面 goto 的超时时间，整体命令超时为此值+30秒"
+  },
+  "default_width": {
+    "description": "默认视窗宽度（像素）",
+    "type": "int",
+    "default": 1920,
+    "hint": "范围 100-4096"
+  },
+  "default_height": {
+    "description": "默认视窗高度（像素）",
+    "type": "int",
+    "default": 1080,
+    "hint": "范围 100-4096"
+  },
+  "block_private_network": {
+    "description": "拦截内网地址（SSRF 防护）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后拒绝解析到内网/回环/保留地址的 URL，并二次校验跳转后的地址"
+  },
+  "user_agent": {
+    "description": "自定义 User-Agent",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用 Chromium 默认 UA"
+  }
+}
