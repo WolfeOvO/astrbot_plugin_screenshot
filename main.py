@@ -20,15 +20,20 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 PLUGIN_NAME = "astrbot_plugin_screenshot"
-PLUGIN_VERSION = "v2.0.0"
+PLUGIN_VERSION = "v2.1.0"
 
 # 支持的截图格式
 SUPPORTED_FORMATS = {"png", "jpeg", "webp"}
 
-# 单次导航的最大超时（毫秒）。跨境站点（如 baidu.com 裸域）的 TCP/TLS
-# 建连可能要 10~17s，必须远大于默认 30s，否则在连接阶段就超时
-# （报错 Page.goto: Timeout 30000ms exceeded）。
+# 完整导航超时（毫秒），用于 www 子域 / 非裸域。实测跨境下裸域（如 baidu.com）
+# 的 TCP/TLS 建连可到 22s+，甚至 >90s 直接卡死（DNS 解析到大陆 CDN 慢节点），
+# 而 www 子域走国际节点通常 <1s。
 NAV_TIMEOUT_MS = 90_000
+
+# 裸域（apex，如 baidu.com）首次导航的短超时（毫秒）。跨境下裸域常卡在 TCP/TLS
+# 建连，15s 足够判断「该裸域境外不通」，随即切 www 重试，避免把 90s 全耗在
+# 裸域上导致外层 120s 总超时（即用户看到的「截图超时(120s)」）。
+BARE_NAV_TIMEOUT_MS = 15_000
 
 # 高清渲染倍率（Retina）。2 = 逻辑像素翻倍，文字/图片更清晰，文件更大。
 SCALE_FACTOR = 2
@@ -94,7 +99,7 @@ class LocalScreenshotPlugin(Star):
         self._browser_lock = asyncio.Lock()
         # 限制并发截图数量，避免同时开太多页面
         self._sem = asyncio.Semaphore(2)
-        logger.info(f"[{PLUGIN_NAME}] 初始化完成 v{PLUGIN_VERSION}，超时={self.timeout_s}s，"
+        logger.info(f"[{PLUGIN_NAME}] 初始化完成 {PLUGIN_VERSION}，超时={self.timeout_s}s，"
                     f"默认尺寸={self.default_width}x{self.default_height}，"
                     f"高清倍率={SCALE_FACTOR}，"
                     f"内网拦截={'开' if self.block_private else '关'}，"
@@ -141,14 +146,10 @@ class LocalScreenshotPlugin(Star):
                 pass
             self._pw = None
 
-    def terminate(self):
-        """插件卸载/重载时清理浏览器。"""
+    async def terminate(self):
+        """插件卸载/重载时清理浏览器。基类 Star.terminate 是 async，AstrBot 会 await。"""
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(self._shutdown_browser())
-            else:
-                loop.run_until_complete(self._shutdown_browser())
+            await self._shutdown_browser()
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 清理浏览器失败: {e}")
 
@@ -232,19 +233,22 @@ class LocalScreenshotPlugin(Star):
     # 截图核心
     # ------------------------------------------------------------------
     async def _navigate(self, page, url: str):
-        """导航到目标 URL。裸域（如 baidu.com）的 301 重定向链在境外
-        可能卡死，自动补 www. 重试一次。"""
+        """导航到目标 URL。裸域（如 baidu.com）跨境建连极慢甚至卡死，
+        先用短超时探测，失败立即补 www. 重试（www 走国际节点通常快得多）。"""
         from urllib.parse import urlparse as _up
+        parsed = _up(url)
+        host = parsed.hostname or ""
+        bare = bool(host) and not host.startswith("www.")
+        # 裸域首跳用短超时，避免把 90s 全耗在慢建连上
+        first_timeout = BARE_NAV_TIMEOUT_MS if bare else NAV_TIMEOUT_MS
         try:
-            await page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.goto(url, timeout=first_timeout, wait_until="domcontentloaded")
             return None
         except Exception as e:
             err = str(e)
-            parsed = _up(url)
-            if parsed.hostname and not parsed.hostname.startswith("www.") \
-                    and "Timeout" in err:
-                new_url = url.replace(f"//{parsed.hostname}", f"//www.{parsed.hostname}", 1)
-                logger.warning(f"[{PLUGIN_NAME}] 裸域导航超时，重试 {new_url}")
+            if bare and "Timeout" in err:
+                new_url = url.replace(f"//{host}", f"//www.{host}", 1)
+                logger.warning(f"[{PLUGIN_NAME}] 裸域 {host} 建连过慢，改用 {new_url}")
                 await page.goto(new_url, timeout=NAV_TIMEOUT_MS,
                                 wait_until="domcontentloaded")
                 return new_url
@@ -254,7 +258,7 @@ class LocalScreenshotPlugin(Star):
         """渲染页面并返回 (截图二进制数据, 元信息 dict)。
 
         高清渲染（device_scale_factor）+ domcontentloaded + 追踪域名拦截。
-        导航超时独立设为 90s，规避跨境建连慢；裸域失败自动补 www 重试。
+        裸域先用 15s 短超时探测，失败自动补 www 重试（90s），规避跨境建连慢。
         """
         host = urlparse(params["url"]).hostname
         if self.block_private:
@@ -379,7 +383,7 @@ class LocalScreenshotPlugin(Star):
         """把插件源码同步推送到 GitHub 仓库。
 
         插件目录在容器内即 /AstrBot/data/plugins/astrbot_plugin_screenshot，
-        宿主机侧挂载可见。使用环境变量 GITHUB_TOKEN 进行认证推送。
+        宿主机侧挂载可见。使用环境变量 GITHUB_TOKEN（个人 PAT）以 WolfeOvO 身份认证推送。
         Returns: 状态字符串。
         """
         import os as _os
@@ -388,7 +392,7 @@ class LocalScreenshotPlugin(Star):
         if not token:
             return "⚠️ 未配置 GITHUB_TOKEN，跳过同步"
         repo = "WolfeOvO/astrbot_plugin_screenshot"
-        remote = f"https://x-access-token:{token}@github.com/{repo}.git"
+        remote = f"https://WolfeOvO:{token}@github.com/{repo}.git"
         try:
             # 在插件目录初始化/复用 git 仓库
             if not _os.path.exists(_os.path.join(plugin_dir, ".git")):
@@ -400,9 +404,9 @@ class LocalScreenshotPlugin(Star):
                 subprocess.run(["git", "remote", "set-url", "origin", remote],
                                cwd=plugin_dir, check=True)
             # 配置身份（仅本仓库）
-            subprocess.run(["git", "config", "user.email", "bot@astrbot.local"],
+            subprocess.run(["git", "config", "user.email", "265155059+WolfeOvO@users.noreply.github.com"],
                            cwd=plugin_dir, check=True)
-            subprocess.run(["git", "config", "user.name", "AstrBot Screenshot Plugin"],
+            subprocess.run(["git", "config", "user.name", "WolfeOvO"],
                            cwd=plugin_dir, check=True)
             # 拉取远端（避免 non-fast-forward）
             subprocess.run(["git", "fetch", "-q", "origin", "main"],
@@ -420,7 +424,7 @@ class LocalScreenshotPlugin(Star):
                                cwd=plugin_dir)
             if r.returncode == 0:
                 return "✅ 源码已是最新，无需推送"
-            msg = f"chore: sync v{PLUGIN_VERSION} @ {time.strftime('%Y-%m-%d %H:%M')}"
+            msg = f"chore: sync {PLUGIN_VERSION} @ {time.strftime('%Y-%m-%d %H:%M')}"
             subprocess.run(["git", "commit", "-q", "-m", msg],
                            cwd=plugin_dir, check=True)
             pr = subprocess.run(["git", "push", "-q", "origin", "HEAD:main"],
@@ -490,15 +494,14 @@ class LocalScreenshotPlugin(Star):
                 f"• 大小：{meta['bytes']/1024:.1f} KB",
                 f"• 渲染耗时：{meta['elapsed']}s",
             ]
-            # GitHub 同步（异步执行，不阻塞发送）
+            # GitHub 同步（后台静默执行，结果不再展示在元信息里）
             if self.sync_github:
                 try:
-                    sync_result = await asyncio.get_event_loop().run_in_executor(
+                    await asyncio.get_event_loop().run_in_executor(
                         None, self._sync_to_github
                     )
-                    meta_lines.append(f"• 源码同步：{sync_result}")
-                except Exception as e:
-                    meta_lines.append(f"• 源码同步：⚠️ {str(e)[:80]}")
+                except Exception:
+                    pass
             yield event.plain_result("\n".join(meta_lines))
         except PermissionError as e:
             logger.warning(f"[{PLUGIN_NAME}] SSRF 拦截: {url} - {e}")
