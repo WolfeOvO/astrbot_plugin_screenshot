@@ -1,7 +1,7 @@
 name: astrbot_plugin_screenshot
 display_name: 本地网页截图
-desc: 基于 Playwright Chromium 的本地网页截图，不依赖第三方截图 API
-version: v2.1.0
+desc: 基于 Playwright Chromium 的本地网页截图（支持整页长图），不依赖第三方截图 API
+version: v2.2.0
 author: WolfeOvO
 repo: https://github.com/WolfeOvO/astrbot_plugin_screenshot
 astrbot_version: ">=4.20,<5"
