@@ -4,6 +4,8 @@
 支持高清渲染（device_scale_factor=2）、发图后追加元数据消息、源码自动同步 GitHub。
 v2.2.0 新增 /截全图 命令：整页滚动长图，自动触发懒加载，超长页面按像素预算
 自动降倍率（CDP 免重导航）或裁剪，避免 Chromium 截图超时/内存爆炸。
+v2.3.0 超限兜底改为无损优先链：PNG 超 15MB 先转无损 WebP（像素级无损），
+仍超限才 JPEG（q95 + 4:4:4 无色度抽样）；兜底缩放改 LANCZOS 高质量重采样。
 """
 
 import asyncio
@@ -23,7 +25,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 PLUGIN_NAME = "astrbot_plugin_screenshot"
-PLUGIN_VERSION = "v2.2.0"
+PLUGIN_VERSION = "v2.3.0"
 
 # 支持的截图格式
 SUPPORTED_FORMATS = {"png", "jpeg", "webp"}
@@ -260,8 +262,9 @@ class LocalScreenshotPlugin(Star):
         parsed = _up(url)
         host = parsed.hostname or ""
         bare = bool(host) and not host.startswith("www.")
-        # 裸域首跳用短超时，避免把 90s 全耗在慢建连上
-        first_timeout = BARE_NAV_TIMEOUT_MS if bare else NAV_TIMEOUT_MS
+        # 裸域首跳用短超时，避免把总超时全耗在慢建连上
+        nav_ms = self.timeout_s * 1000
+        first_timeout = min(BARE_NAV_TIMEOUT_MS, nav_ms) if bare else nav_ms
         try:
             await page.goto(url, timeout=first_timeout, wait_until="domcontentloaded")
             return None
@@ -270,7 +273,7 @@ class LocalScreenshotPlugin(Star):
             if bare and "Timeout" in err:
                 new_url = url.replace(f"//{host}", f"//www.{host}", 1)
                 logger.warning(f"[{PLUGIN_NAME}] 裸域 {host} 建连过慢，改用 {new_url}")
-                await page.goto(new_url, timeout=NAV_TIMEOUT_MS,
+                await page.goto(new_url, timeout=nav_ms,
                                 wait_until="domcontentloaded")
                 return new_url
             raise
@@ -370,20 +373,55 @@ class LocalScreenshotPlugin(Star):
 
     @staticmethod
     def _to_jpeg(data: bytes) -> Optional[bytes]:
-        """PNG 转高质量 JPEG（q90）。整页长图超大小限制时兜底用。"""
+        """转高质量 JPEG（q95 + 4:4:4 无色度抽样，视觉近无损）。
+
+        无损 WebP 仍超限时的次优兜底。JPEG 不支持透明通道，透明区域拍平到白底。
+        """
         try:
             import io
 
             from PIL import Image
 
             img = Image.open(io.BytesIO(data))
-            if img.mode not in ("RGB", "L"):
+            if img.mode in ("RGBA", "LA", "P"):
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
+            img.save(buf, format="JPEG", quality=95, subsampling=0, optimize=True)
             return buf.getvalue()
         except Exception as e:
-            logger.warning(f"[{PLUGIN_NAME}] PNG 转 JPEG 失败: {e}")
+            logger.warning(f"[{PLUGIN_NAME}] 转 JPEG 失败: {e}")
+            return None
+
+    # WebP 格式硬限制：单边最多 16383 像素（libwebp 编码器限制）
+    WEBP_MAX_EDGE = 16383
+
+    @staticmethod
+    def _to_lossless_webp(data: bytes) -> Optional[bytes]:
+        """转无损 WebP（lossless=True，像素级无损，保留透明通道）。
+
+        网页类内容（大面积纯色/文字/渐变）的无损 WebP 通常只有 PNG 的 40-70%，
+        是 PNG 超大小限制时的第一优先兜底：不丢任何像素信息。
+        注意：任一边超过 16383px 的超长图无法编码 WebP，直接返回 None。
+        """
+        try:
+            import io
+
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(data))
+            if max(img.size) > LocalScreenshotPlugin.WEBP_MAX_EDGE:
+                return None
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
+            return buf.getvalue()
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] PNG 转无损 WebP 失败: {e}")
             return None
 
     async def _render(self, params: dict) -> tuple[bytes, dict]:
@@ -550,14 +588,23 @@ class LocalScreenshotPlugin(Star):
             from PIL import Image
 
             img = Image.open(io.BytesIO(data))
+            resample = Image.Resampling.LANCZOS
             for _ in range(4):
                 w, h = img.size
-                img = img.resize((w * 3 // 4, h * 3 // 4))
+                img = img.resize((w * 3 // 4, h * 3 // 4), resample)
                 buf = io.BytesIO()
                 save_fmt = "JPEG" if fmt == "jpeg" else fmt.upper()
-                save_kwargs = {"quality": 90} if fmt in ("jpeg", "webp") else {}
-                if save_fmt == "JPEG" and img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
+                save_kwargs = {}
+                if save_fmt == "JPEG":
+                    if img.mode in ("RGBA", "P", "LA"):
+                        if img.mode == "P":
+                            img = img.convert("RGBA")
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        bg.paste(img, mask=img.split()[-1])
+                        img = bg
+                    save_kwargs = {"quality": 95, "subsampling": 0, "optimize": True}
+                elif save_fmt == "WEBP":
+                    save_kwargs = {"lossless": True, "quality": 100, "method": 6}
                 img.save(buf, format=save_fmt, **save_kwargs)
                 data = buf.getvalue()
                 if len(data) <= max_size:
@@ -660,23 +707,33 @@ class LocalScreenshotPlugin(Star):
                 data, meta = await asyncio.wait_for(
                     self._render(params), timeout=outer_timeout
                 )
-            # 整页 PNG 超限兜底：转高质量 JPEG（网页长图几乎不需要透明通道）
-            if (params["full"] and params["format"] == "png"
-                    and len(data) > self.MAX_FILE_SIZE):
-                jpeg = self._to_jpeg(data)
-                if jpeg and len(jpeg) < len(data):
-                    data = jpeg
-                    params["format"] = "jpeg"
-                    meta["format"] = "jpeg"
+            # PNG 超限兜底（无损优先链）：先无损 WebP（像素级无损），仍超限才 JPEG
+            if (params["format"] == "png" and len(data) > self.MAX_FILE_SIZE):
+                webp = await asyncio.to_thread(self._to_lossless_webp, data)
+                if webp and len(webp) <= self.MAX_FILE_SIZE:
+                    data = webp
+                    params["format"] = "webp"
+                    meta["format"] = "webp"
                     meta.setdefault("notes", []).append(
-                        "PNG 超过大小限制，已自动转为 JPEG")
-            data = self._shrink_if_needed(data, params["format"], self.MAX_FILE_SIZE)
+                        f"PNG 超过 {self.MAX_FILE_SIZE // 1024 // 1024}MB，"
+                        "已自动转为无损 WebP（像素级无损）")
+                else:
+                    jpeg = await asyncio.to_thread(self._to_jpeg, data)
+                    if jpeg and len(jpeg) < len(data):
+                        data = jpeg
+                        params["format"] = "jpeg"
+                        meta["format"] = "jpeg"
+                        meta.setdefault("notes", []).append(
+                            "PNG 超限且无损 WebP 不可用（超长图或仍超限），"
+                        "已转为高质量 JPEG（q95）")
+            data = await asyncio.to_thread(
+                self._shrink_if_needed, data, params["format"], self.MAX_FILE_SIZE)
             if len(data) > self.MAX_FILE_SIZE:
-                hint = "，可尝试 format=jpeg / scale=1"
+                hint = "，可尝试 scale=1"
                 if params["full"]:
                     hint += " 或减小 width"
                 else:
-                    hint += " 或 full=0"
+                    hint += " 或 format=jpeg"
                 yield event.plain_result(
                     f"❌ 截图过大（{len(data) / 1024 / 1024:.1f}MB），"
                     f"超过 {self.MAX_FILE_SIZE // 1024 // 1024}MB 限制{hint}"
